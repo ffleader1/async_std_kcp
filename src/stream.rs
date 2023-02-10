@@ -9,9 +9,11 @@ use std::{
 use futures::{future, ready};
 use kcp::{Error as KcpError, KcpResult};
 use log::trace;
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::UdpSocket,
+use  futures::io::{AsyncRead, AsyncWrite};
+
+use async_std::{
+
+    net::{UdpSocket}
 };
 
 use crate::{config::KcpConfig, session::KcpSession, skcp::KcpSocket};
@@ -62,7 +64,6 @@ impl KcpStream {
 
     /// `send` data in `buf`
     pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
-        // Mutex doesn't have poll_lock, spinning on it.
         let mut kcp = self.session.kcp_socket().lock();
         let result = ready!(kcp.poll_send(cx, buf));
         self.session.notify();
@@ -85,7 +86,7 @@ impl KcpStream {
                 buf[..copy_length]
                     .copy_from_slice(&self.recv_buffer[self.recv_buffer_pos..self.recv_buffer_pos + copy_length]);
                 self.recv_buffer_pos += copy_length;
-                return Ok(copy_length).into();
+                return  Ok(copy_length).into();
             }
 
             // Mutex doesn't have poll_lock, spinning on it.
@@ -97,7 +98,11 @@ impl KcpStream {
 
             // 1.1. User's provided buffer is larger than available buffer's size
             if peek_size > 0 && peek_size <= buf.len() {
-                match ready!(kcp.poll_recv(cx, buf)) {
+                let poll: Result<_, _> = match kcp.poll_recv(cx, buf) {
+                    Poll::Ready(r) => r,
+                    Poll::Pending => { return  Poll::Pending},
+                };
+                match poll {
                     Ok(n) => {
                         trace!("[CLIENT] recv directly {} bytes", n);
                         return Ok(n).into();
@@ -113,16 +118,26 @@ impl KcpStream {
                 self.recv_buffer.resize(required_size, 0);
             }
 
-            match ready!(kcp.poll_recv(cx, &mut self.recv_buffer)) {
-                Ok(0) => return Ok(0).into(),
+            let poll: Result<_, _> = match kcp.poll_recv(cx, &mut self.recv_buffer) {
+                Poll::Ready(r) => r,
+                Poll::Pending => {return  Poll::Pending;}, // early return here if kcp isn't ready yet
+            };
+
+            match poll {
+                Ok(0) => {
+                    return Ok(0).into()
+                },
                 Ok(n) => {
                     trace!("[CLIENT] recv buffered {} bytes", n);
                     self.recv_buffer_pos = 0;
                     self.recv_buffer_cap = n;
                 }
-                Err(err) => return Err(err).into(),
+                Err(err) => {
+                    return Err(err).into()
+                },
             }
         }
+
     }
 
     /// `recv` data into `buf`
@@ -132,22 +147,28 @@ impl KcpStream {
 }
 
 impl AsyncRead for KcpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        match ready!(self.poll_recv(cx, buf.initialize_unfilled())) {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: &mut [u8]) -> Poll<io::Result<usize>> {
+
+        let poll: Result<_, _> = match self.poll_recv(cx, buf) {
+            Poll::Ready(r) => r,
+            Poll::Pending => {return Poll::Pending},
+        };
+
+        return match poll {
             Ok(n) => {
-                buf.advance(n);
-                Ok(()).into()
+                buf = buf[n..].as_mut();
+                Poll::Ready(Ok(n))
             }
-            Err(KcpError::IoError(err)) => Err(err).into(),
+            Err(KcpError::IoError(err)) =>Err(err).into(),
             Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
-        }
+        };
     }
 }
 
 impl AsyncWrite for KcpStream {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match ready!(self.poll_send(cx, buf)) {
-            Ok(n) => Ok(n).into(),
+            Ok(n) => Poll::Ready(Ok(n)),
             Err(KcpError::IoError(err)) => Err(err).into(),
             Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
         }
@@ -166,7 +187,7 @@ impl AsyncWrite for KcpStream {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Ok(()).into()
     }
 }

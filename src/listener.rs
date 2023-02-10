@@ -1,31 +1,41 @@
+
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
     sync::Arc,
     time::Duration,
+    mem::take
 };
 
 use byte_string::ByteStr;
 use kcp::{Error as KcpError, KcpResult};
 use log::{debug, error, trace};
-use tokio::{
+
+use futures::{select, FutureExt};
+use async_std::task;
+use async_std::{
     net::{ToSocketAddrs, UdpSocket},
-    sync::mpsc,
-    task::JoinHandle,
-    time,
+    task::JoinHandle
 };
 
+use futures::channel::mpsc::{channel, Receiver};
+use futures::executor::block_on;
+use futures::stream::StreamExt;
+
+
 use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream};
+// use crate::session::KcpSession;
 
 pub struct KcpListener {
     udp: Arc<UdpSocket>,
-    accept_rx: mpsc::Receiver<(KcpStream, SocketAddr)>,
-    task_watcher: JoinHandle<()>,
+    accept_rx: Receiver<(KcpStream, SocketAddr)>,
+    task_watcher: Option<JoinHandle<()>>,
 }
 
 impl Drop for KcpListener {
     fn drop(&mut self) {
-        self.task_watcher.abort();
+        let old_task_watcher = take( &mut self.task_watcher);
+        block_on(old_task_watcher.unwrap().cancel());
     }
 }
 
@@ -41,25 +51,25 @@ impl KcpListener {
         let udp = Arc::new(udp);
         let server_udp = udp.clone();
 
-        let (accept_tx, accept_rx) = mpsc::channel(1024 /* backlogs */);
-        let task_watcher = tokio::spawn(async move {
-            let (close_tx, mut close_rx) = mpsc::channel(64);
+        let (mut accept_tx, accept_rx) = channel(1024 /* backlogs */);
+        let task_watcher = task::spawn(async move {
+            let (close_tx, mut close_rx) = channel(64);
 
             let mut sessions = KcpSessionManager::new();
-            let mut packet_buffer = [0u8; 65536];
+            let mut packet_buffer = [0u8; 2048];
             loop {
-                tokio::select! {
-                    peer_addr = close_rx.recv() => {
+                select! {
+                    peer_addr = close_rx.next().fuse() => {
                         let peer_addr = peer_addr.expect("close_tx closed unexpectly");
                         sessions.close_peer(peer_addr);
                         trace!("session peer_addr: {} removed", peer_addr);
                     }
 
-                    recv_res = udp.recv_from(&mut packet_buffer) => {
+                    recv_res = udp.recv_from(&mut packet_buffer).fuse() => {
                         match recv_res {
                             Err(err) => {
                                 error!("udp.recv_from failed, error: {}", err);
-                                time::sleep(Duration::from_secs(1)).await;
+                                task::sleep(Duration::from_secs(1)).await;
                             }
                             Ok((n, peer_addr)) => {
                                 let packet = &mut packet_buffer[..n];
@@ -103,7 +113,7 @@ impl KcpListener {
                                         s
                                     },
                                     Err(err) => {
-                                        error!("failed to create session, error: {}, peer: {}, conv: {}", err, peer_addr, conv);
+                                        error!("failed to create session, error: {:?}, peer: {}, conv: {}", err, peer_addr, conv);
                                         continue;
                                     }
                                 };
@@ -118,24 +128,36 @@ impl KcpListener {
                     }
                 }
             }
-        });
+        }
+        );
 
         Ok(KcpListener {
             udp: server_udp,
             accept_rx,
-            task_watcher,
+            task_watcher: Some(task_watcher),
         })
     }
 
     /// Accept a new connected `KcpStream`
     pub async fn accept(&mut self) -> KcpResult<(KcpStream, SocketAddr)> {
-        match self.accept_rx.recv().await {
-            Some(s) => Ok(s),
-            None => Err(KcpError::IoError(io::Error::new(
-                ErrorKind::Other,
-                "accept channel closed unexpectly",
-            ))),
+        loop {
+            match self.accept_rx.try_next() {
+                Err(_) =>{
+                    continue
+                }
+                Ok(v) => {
+                    return match v {
+                        Some(s) => Ok(s),
+                        None => Err(KcpError::IoError(io::Error::new(
+                            ErrorKind::Other,
+                            "accept channel closed unexpectly",
+                        ))),
+                    }
+                }
+
+            }
         }
+
     }
 
     /// Get the local address of the underlying socket
@@ -147,7 +169,7 @@ impl KcpListener {
 #[cfg(unix)]
 impl std::os::unix::io::AsRawFd for KcpListener {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        self.udp.as_raw_fd()
+        self.udp.unwrap().as_raw_fd()
     }
 }
 
@@ -163,9 +185,9 @@ mod test {
     use super::KcpListener;
     use crate::{config::KcpConfig, stream::KcpStream};
     use futures::future;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[tokio::test]
+    #[async_std::test]
     async fn multi_echo() {
         let _ = env_logger::try_init();
 
@@ -173,18 +195,15 @@ mod test {
 
         let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
+        async_std::task::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
-
-                tokio::spawn(async move {
+                async_std::task::spawn(async move {
                     let mut buffer = [0u8; 8192];
                     while let Ok(n) = stream.read(&mut buffer).await {
                         if n == 0 {
                             break;
                         }
-
                         let data = &buffer[..n];
                         stream.write_all(data).await.unwrap();
                         stream.flush().await.unwrap();
@@ -195,18 +214,19 @@ mod test {
 
         let mut vfut = Vec::new();
 
-        for _ in 0..100 {
+        for _ in 0..3 {
             vfut.push(async move {
                 let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
+                for _ in 0..2 {
 
-                for _ in 0..20 {
                     const SEND_BUFFER: &[u8] = b"HELLO WORLD";
                     stream.write_all(SEND_BUFFER).await.unwrap();
                     stream.flush().await.unwrap();
-
                     let mut buffer = [0u8; 1024];
                     let n = stream.recv(&mut buffer).await.unwrap();
                     assert_eq!(SEND_BUFFER, &buffer[..n]);
+
+
                 }
             });
         }

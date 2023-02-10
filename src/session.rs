@@ -6,27 +6,36 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::Duration
 };
+
 
 use byte_string::ByteStr;
 use kcp::KcpResult;
 use log::{error, trace};
 use spin::Mutex as SpinMutex;
-use tokio::{
-    net::UdpSocket,
-    sync::{mpsc, Notify},
-    time::{self, Instant},
+
+use futures::{FutureExt, select};
+use async_notify::Notify;
+
+use async_std::{
+    task,
+    net::{UdpSocket}
 };
 
+use futures::channel::mpsc::{channel, Sender};
+use futures::stream::StreamExt;
+use futures::sink::SinkExt;
+
 use crate::{skcp::KcpSocket, KcpConfig};
+
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
     closed: AtomicBool,
     session_expire: Duration,
-    session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
-    input_tx: mpsc::Sender<Vec<u8>>,
+    session_close_notifier: Option<(Sender<SocketAddr>, SocketAddr)>,
+    input_tx: Sender<Vec<u8>>,
     notifier: Notify,
 }
 
@@ -40,12 +49,13 @@ impl Drop for KcpSession {
     }
 }
 
+
 impl KcpSession {
     fn new(
         socket: KcpSocket,
         session_expire: Duration,
-        session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
-        input_tx: mpsc::Sender<Vec<u8>>,
+        session_close_notifier: Option<(Sender<SocketAddr>, SocketAddr)>,
+        input_tx: Sender<Vec<u8>>,
     ) -> KcpSession {
         KcpSession {
             socket: SpinMutex::new(socket),
@@ -60,11 +70,11 @@ impl KcpSession {
     pub fn new_shared(
         socket: KcpSocket,
         session_expire: Duration,
-        session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
+        session_close_notifier: Option<(Sender<SocketAddr>, SocketAddr)>,
     ) -> Arc<KcpSession> {
         let is_client = session_close_notifier.is_none();
 
-        let (input_tx, mut input_rx) = mpsc::channel(64);
+        let (input_tx, mut input_rx) = channel(64);
 
         let udp_socket = socket.udp_socket().clone();
 
@@ -77,40 +87,43 @@ impl KcpSession {
 
         let io_task_handle = {
             let session = session.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 let mut input_buffer = [0u8; 65536];
 
                 loop {
-                    tokio::select! {
+                    futures::select! {
                         // recv() then input()
                         // Drives the KCP machine forward
-                        recv_result = udp_socket.recv(&mut input_buffer), if is_client => {
-                            match recv_result {
-                                Err(err) => {
-                                    error!("[SESSION] UDP recv failed, error: {}", err);
-                                }
-                                Ok(n) => {
-                                    let input_buffer = &input_buffer[..n];
-                                    let input_conv = kcp::get_conv(input_buffer);
-                                    trace!("[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
-                                           n, input_conv, ByteStr::new(input_buffer));
 
-                                    let mut socket = session.socket.lock();
-
-                                    // Server may allocate another conv for this client.
-                                    if !socket.waiting_conv() && socket.conv() != input_conv {
-                                        trace!("[SESSION] UDP input conv: {} replaces session conv: {}", input_conv, socket.conv());
-                                        socket.set_conv(input_conv);
+                        recv_result = udp_socket.recv(&mut input_buffer).fuse() => {
+                            if is_client {
+                                match recv_result {
+                                    Err(err) => {
+                                        error!("[SESSION] UDP recv failed, error: {}", err);
                                     }
+                                    Ok(n) => {
+                                        let input_buffer = &input_buffer[..n];
+                                        let input_conv = kcp::get_conv(input_buffer);
+                                        trace!("[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
+                                               n, input_conv, ByteStr::new(input_buffer));
 
-                                    match socket.input(input_buffer) {
-                                        Ok(true) => {
-                                            trace!("[SESSION] UDP input {} bytes and waked sender/receiver", n);
+                                        let mut socket = session.socket.lock();
+
+                                        // Server may allocate another conv for this client.
+                                        if !socket.waiting_conv() && socket.conv() != input_conv {
+                                            trace!("[SESSION] UDP input conv: {} replaces session conv: {}", input_conv, socket.conv());
+                                            socket.set_conv(input_conv);
                                         }
-                                        Ok(false) => {}
-                                        Err(err) => {
-                                            error!("[SESSION] UDP input {} bytes error: {}, input buffer {:?}",
-                                                   n, err, ByteStr::new(input_buffer));
+
+                                        match socket.input(input_buffer) {
+                                            Ok(true) => {
+                                                trace!("[SESSION] UDP input {} bytes and waked sender/receiver", n);
+                                            }
+                                            Ok(false) => {}
+                                            Err(err) => {
+                                                error!("[SESSION] UDP input {} bytes error: {:?}, input buffer {:?}",
+                                                       n, err, ByteStr::new(input_buffer));
+                                            }
                                         }
                                     }
                                 }
@@ -118,7 +131,8 @@ impl KcpSession {
                         }
 
                         // bytes received from listener socket
-                        input_opt = input_rx.recv() => {
+
+                        input_opt = input_rx.next().fuse() => {
                             if let Some(input_buffer) = input_opt {
                                 let mut socket = session.socket.lock();
                                 match socket.input(&input_buffer) {
@@ -129,7 +143,7 @@ impl KcpSession {
                                                input_buffer.len(), waked);
                                     }
                                     Err(err) => {
-                                        error!("[SESSION] UDP input {} bytes from channel failed, error: {}, input buffer {:?}",
+                                        error!("[SESSION] UDP input {} bytes from channel failed, error: {:?}, input buffer {:?}",
                                                input_buffer.len(), err, ByteStr::new(&input_buffer));
                                     }
                                 }
@@ -143,7 +157,7 @@ impl KcpSession {
         // Per-session updater
         {
             let session = session.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 while !session.closed.load(Ordering::Relaxed) {
                     let next = {
                         let mut socket = session.socket.lock();
@@ -188,17 +202,17 @@ impl KcpSession {
                         }
 
                         match socket.update() {
-                            Ok(next_next) => Instant::from_std(next_next),
+                            Ok(next_next) => next_next,
                             Err(err) => {
-                                error!("[SESSION] KCP update failed, error: {}", err);
-                                Instant::now() + Duration::from_millis(10)
+                                error!("[SESSION] KCP update failed, error: {:?}", err);
+                                Duration::from_millis(10)
                             }
                         }
                     };
 
-                    tokio::select! {
-                        _ = time::sleep_until(next) => {},
-                        _ = session.notifier.notified() => {},
+                    select! {
+                        _ = {task::sleep(next).await;futures::future::ready(4)} => {},
+                        _ = session.notifier.notified().fuse() => {},
                     }
                 }
 
@@ -211,11 +225,12 @@ impl KcpSession {
                 }
 
                 if let Some((ref notifier, peer_addr)) = session.session_close_notifier {
-                    let _ = notifier.send(peer_addr).await;
+                    let mut notifier_clone = notifier.clone();
+                    let _ = notifier_clone.send(peer_addr).await;
                 }
 
                 session.closed.store(true, Ordering::Release);
-                io_task_handle.abort();
+                io_task_handle.cancel().await;
 
                 trace!("[SESSION] KCP session closed");
             });
@@ -233,8 +248,10 @@ impl KcpSession {
         self.notify();
     }
 
+
     pub async fn input(&self, buf: &[u8]) {
-        self.input_tx.send(buf.to_owned()).await.expect("input channel closed")
+        let mut input_tx = self.input_tx.clone();
+        input_tx.send(buf.to_owned()).await.expect("input channel closed")
     }
 
     pub async fn conv(&self) -> u32 {
@@ -243,7 +260,7 @@ impl KcpSession {
     }
 
     pub fn notify(&self) {
-        self.notifier.notify_one();
+        self.notifier.notify();
     }
 }
 
@@ -290,7 +307,7 @@ impl KcpSessionManager {
         sn: u32,
         udp: &Arc<UdpSocket>,
         peer_addr: SocketAddr,
-        session_close_notifier: &mpsc::Sender<SocketAddr>,
+        session_close_notifier: &Sender<SocketAddr>,
     ) -> KcpResult<(Arc<KcpSession>, bool)> {
         match self.sessions.entry(peer_addr) {
             Entry::Occupied(mut occ) => {

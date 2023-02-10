@@ -9,7 +9,14 @@ use std::{
 use futures::future;
 use kcp::{Error as KcpError, Kcp, KcpResult};
 use log::{error, trace};
-use tokio::{net::UdpSocket, sync::mpsc};
+use async_std::{
+    task,
+    net::{UdpSocket}
+};
+use futures::channel::mpsc::{self, UnboundedSender};
+use futures::stream::StreamExt;
+use futures::SinkExt;
+
 
 use crate::{utils::now_millis, KcpConfig};
 
@@ -17,18 +24,19 @@ use crate::{utils::now_millis, KcpConfig};
 struct UdpOutput {
     socket: Arc<UdpSocket>,
     target_addr: SocketAddr,
-    delay_tx: mpsc::UnboundedSender<Vec<u8>>,
+    delay_tx: UnboundedSender<Vec<u8>>,
 }
+
 
 impl UdpOutput {
     /// Create a new Writer for writing packets to UdpSocket
     pub fn new(socket: Arc<UdpSocket>, target_addr: SocketAddr) -> UdpOutput {
-        let (delay_tx, mut delay_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (delay_tx, mut delay_rx) = mpsc::unbounded::<Vec<u8>>();
 
         {
             let socket = socket.clone();
-            tokio::spawn(async move {
-                while let Some(buf) = delay_rx.recv().await {
+            task::spawn(async move {
+                while let Some(buf) = delay_rx.next().await {
                     if let Err(err) = socket.send_to(&buf, target_addr).await {
                         error!("[SEND] UDP delayed send failed, error: {}", err);
                     }
@@ -44,21 +52,27 @@ impl UdpOutput {
     }
 }
 
+
 impl Write for UdpOutput {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.socket.try_send_to(buf, self.target_addr) {
-            Ok(n) => Ok(n),
+        let result = task::block_on(self.socket.send_to(buf, self.target_addr));
+        match result {
+            Ok(n) => {Ok(n)}
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
-                // send return EAGAIN
-                // ignored as packet was lost in transmission
                 trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, delayed send", buf.len());
 
-                self.delay_tx.send(buf.to_owned()).expect("channel closed unexpectly");
-
+                let s = task::block_on( self.delay_tx.send(buf.to_owned()));
+                match s {
+                    Ok(_) => {}
+                    Err(..) => {
+                        println!("Socket closed unexpectedly")
+                    }
+                }
                 Ok(buf.len())
             }
             Err(err) => Err(err),
         }
+
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -202,7 +216,7 @@ impl KcpSocket {
             return Ok(0).into();
         }
 
-        match self.kcp.recv(buf) {
+        let r = match self.kcp.recv(buf) {
             e @ (Ok(0) | Err(KcpError::RecvQueueEmpty) | Err(KcpError::ExpectingFragment)) => {
                 trace!(
                     "[RECV] rcvwnd={} peeksize={} r={:?}",
@@ -210,21 +224,25 @@ impl KcpSocket {
                     self.kcp.peeksize().unwrap_or(0),
                     e
                 );
-
+                //println!("hi1");
                 if let Some(waker) = self.pending_receiver.replace(cx.waker().clone()) {
                     if !cx.waker().will_wake(&waker) {
                         waker.wake();
                     }
                 }
-
+                //println!("hi2");
                 Poll::Pending
             }
-            Err(err) => Err(err).into(),
+            Err(err) => {println!("hi3");Err(err).into()},
             Ok(n) => {
+                //println!("hi4");
                 self.last_update = Instant::now();
                 Ok(n).into()
             }
-        }
+        };
+        //println!("Poll iin result {:?}", r);
+        //println!("hi out 5");
+        r
     }
 
     #[allow(dead_code)]
@@ -266,14 +284,14 @@ impl KcpSocket {
         waked
     }
 
-    pub fn update(&mut self) -> KcpResult<Instant> {
+    pub fn update(&mut self) -> KcpResult<Duration> {
         let now = now_millis();
         self.kcp.update(now)?;
         let next = self.kcp.check(now);
 
         self.try_wake_pending_waker();
 
-        Ok(Instant::now() + Duration::from_millis(next as u64))
+        Ok(Duration::from_millis(next as u64))
     }
 
     pub fn close(&mut self) {
@@ -326,16 +344,21 @@ mod test {
     use kcp::Error as KcpError;
     use log::trace;
     use std::sync::Arc;
-    use tokio::{
-        net::UdpSocket,
-        sync::Mutex,
-        time::{self, Instant},
+    // use tokio::{
+    //     net::UdpSocket,
+    //     sync::Mutex,
+    //     time::{self, Instant},
+    // };
+    use async_std::{
+        task,
+        net::{UdpSocket},
+        sync::Mutex
     };
-
     use super::KcpSocket;
     use crate::config::KcpConfig;
 
-    #[tokio::test]
+
+    #[async_std::test]
     async fn kcp_echo() {
         let _ = env_logger::try_init();
 
@@ -360,24 +383,26 @@ mod test {
 
         let kcp1_task = {
             let kcp1 = kcp1.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 loop {
                     let mut kcp = kcp1.lock().await;
                     let next = kcp.update().expect("update");
-                    trace!("kcp1 next tick {:?}", next);
-                    time::sleep_until(Instant::from_std(next)).await;
+                    //println!("kcp1 next tick {:?} in", next);
+                    trace!("kcp1 next tick {:?} in", next);
+                    task::sleep(next).await;
                 }
             })
         };
 
         let kcp2_task = {
             let kcp2 = kcp2.clone();
-            tokio::spawn(async move {
+            task::spawn(async move {
                 loop {
                     let mut kcp = kcp2.lock().await;
                     let next = kcp.update().expect("update");
-                    trace!("kcp2 next tick {:?}", next);
-                    time::sleep_until(Instant::from_std(next)).await;
+                    //println!("kcp2 next tick {:?} in", next);
+                    trace!("kcp2 next tick {:?} in", next);
+                    task::sleep(next).await;
                 }
             })
         };
@@ -389,7 +414,7 @@ mod test {
             assert_eq!(n, SEND_BUFFER.len());
         }
 
-        let echo_task = tokio::spawn(async move {
+        let echo_task = task::spawn(async move {
             let mut buf = [0u8; 1024];
 
             loop {
@@ -447,8 +472,8 @@ mod test {
             }
         }
 
-        echo_task.abort();
-        kcp1_task.abort();
-        kcp2_task.abort();
+        echo_task.cancel().await;
+        kcp1_task.cancel().await;
+        kcp2_task.cancel().await;
     }
 }

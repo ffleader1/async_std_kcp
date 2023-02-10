@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, str};
 
-use tokio::io::{stdin, AsyncReadExt, AsyncWriteExt};
+use async_std::io::{stdin};
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_kcp::{KcpConfig, KcpStream};
 
 #[tokio::main]

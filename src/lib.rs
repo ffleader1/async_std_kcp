@@ -1,5 +1,7 @@
 //! Library of KCP on Tokio
 
+extern crate core;
+
 pub use self::{
     config::{KcpConfig, KcpNoDelayConfig},
     listener::KcpListener,
@@ -12,3 +14,4 @@ mod session;
 mod skcp;
 mod stream;
 mod utils;
+

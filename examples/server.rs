@@ -2,35 +2,39 @@ use std::{net::SocketAddr, time::Duration};
 
 use byte_string::ByteStr;
 use log::{debug, error, info};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time,
-};
+// use tokio::{
+//     io::{AsyncReadExt, AsyncWriteExt},
+//     time,
+// };
+
+use  futures::io::{AsyncWriteExt, AsyncReadExt};
+use async_std::task;
 use tokio_kcp::{KcpConfig, KcpListener};
 
-#[tokio::main]
+#[async_std::main]
 async fn main() {
     env_logger::init();
-
+    println!("so 1");
     let config = KcpConfig::default();
-
+    println!("so 2");
     let server_addr = "127.0.0.1:3100".parse::<SocketAddr>().unwrap();
-
+    println!("so 3");
     let mut listener = KcpListener::bind(config, server_addr).await.unwrap();
-
+    println!("so 3.5");
     loop {
+        println!("so 3");
         let (mut stream, peer_addr) = match listener.accept().await {
             Ok(s) => s,
             Err(err) => {
-                error!("accept failed, error: {}", err);
-                time::sleep(Duration::from_secs(1)).await;
+                error!("accept failed, error: {:?}", err);
+                task::sleep(Duration::from_secs(1)).await;
                 continue;
             }
         };
-
+        println!("so 4");
         info!("accepted {}", peer_addr);
 
-        tokio::spawn(async move {
+        task::spawn(async move {
             let mut buffer = [0u8; 8192];
             while let Ok(n) = stream.read(&mut buffer).await {
                 debug!("recv {:?}", ByteStr::new(&buffer[..n]));
