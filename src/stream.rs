@@ -98,11 +98,7 @@ impl KcpStream {
 
             // 1.1. User's provided buffer is larger than available buffer's size
             if peek_size > 0 && peek_size <= buf.len() {
-                let poll: Result<_, _> = match kcp.poll_recv(cx, buf) {
-                    Poll::Ready(r) => r,
-                    Poll::Pending => { return  Poll::Pending},
-                };
-                match poll {
+                match ready!(kcp.poll_recv(cx, buf)) {
                     Ok(n) => {
                         trace!("[CLIENT] recv directly {} bytes", n);
                         return Ok(n).into();
@@ -118,12 +114,7 @@ impl KcpStream {
                 self.recv_buffer.resize(required_size, 0);
             }
 
-            let poll: Result<_, _> = match kcp.poll_recv(cx, &mut self.recv_buffer) {
-                Poll::Ready(r) => r,
-                Poll::Pending => {return  Poll::Pending;}, // early return here if kcp isn't ready yet
-            };
-
-            match poll {
+            match ready!(kcp.poll_recv(cx, &mut self.recv_buffer)) {
                 Ok(0) => {
                     return Ok(0).into()
                 },
@@ -148,20 +139,14 @@ impl KcpStream {
 
 impl AsyncRead for KcpStream {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: &mut [u8]) -> Poll<io::Result<usize>> {
-
-        let poll: Result<_, _> = match self.poll_recv(cx, buf) {
-            Poll::Ready(r) => r,
-            Poll::Pending => {return Poll::Pending},
-        };
-
-        return match poll {
+        match ready!(self.poll_recv(cx, buf)) {
             Ok(n) => {
                 buf = buf[n..].as_mut();
                 Poll::Ready(Ok(n))
             }
             Err(KcpError::IoError(err)) =>Err(err).into(),
             Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
-        };
+        }
     }
 }
 
