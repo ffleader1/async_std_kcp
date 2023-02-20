@@ -193,8 +193,9 @@ mod test {
 
         let config = KcpConfig::default();
 
-        let mut listener = KcpListener::bind(config, "127.0.0.1:0").await.unwrap();
+        let mut listener = KcpListener::bind(config, "127.0.0.1:8889").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
+
         async_std::task::spawn(async move {
             loop {
                 let (mut stream, _) = listener.accept().await.unwrap();
@@ -214,7 +215,7 @@ mod test {
 
         let mut vfut = Vec::new();
 
-        for _ in 0..3 {
+        for _ in 0..5 {
             vfut.push(async move {
                 let mut stream = KcpStream::connect(&config, server_addr).await.unwrap();
                 for _ in 0..2 {

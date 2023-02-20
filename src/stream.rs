@@ -138,10 +138,11 @@ impl KcpStream {
 }
 
 impl AsyncRead for KcpStream {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, mut buf: &mut [u8]) -> Poll<io::Result<usize>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        // buf = buf[n..].as_mut();
         match ready!(self.poll_recv(cx, buf)) {
             Ok(n) => {
-                buf = buf[n..].as_mut();
+                //buf = buf[n..].as_mut();
                 Poll::Ready(Ok(n))
             }
             Err(KcpError::IoError(err)) =>Err(err).into(),
