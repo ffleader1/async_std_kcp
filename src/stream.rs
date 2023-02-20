@@ -9,10 +9,9 @@ use std::{
 use futures::{future, ready};
 use kcp::{Error as KcpError, KcpResult};
 use log::trace;
-use  futures::io::{AsyncRead, AsyncWrite};
+use futures::io::{AsyncRead, AsyncWrite};
 
 use async_std::{
-
     net::{UdpSocket}
 };
 
@@ -64,6 +63,7 @@ impl KcpStream {
 
     /// `send` data in `buf`
     pub fn poll_send(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<KcpResult<usize>> {
+        // Mutex doesn't have poll_lock, spinning on it.
         let mut kcp = self.session.kcp_socket().lock();
         let result = ready!(kcp.poll_send(cx, buf));
         self.session.notify();
@@ -86,7 +86,7 @@ impl KcpStream {
                 buf[..copy_length]
                     .copy_from_slice(&self.recv_buffer[self.recv_buffer_pos..self.recv_buffer_pos + copy_length]);
                 self.recv_buffer_pos += copy_length;
-                return  Ok(copy_length).into();
+                return Ok(copy_length).into();
             }
 
             // Mutex doesn't have poll_lock, spinning on it.
@@ -115,20 +115,15 @@ impl KcpStream {
             }
 
             match ready!(kcp.poll_recv(cx, &mut self.recv_buffer)) {
-                Ok(0) => {
-                    return Ok(0).into()
-                },
+                Ok(0) => return Ok(0).into(),
                 Ok(n) => {
                     trace!("[CLIENT] recv buffered {} bytes", n);
                     self.recv_buffer_pos = 0;
                     self.recv_buffer_cap = n;
                 }
-                Err(err) => {
-                    return Err(err).into()
-                },
+                Err(err) => return Err(err).into(),
             }
         }
-
     }
 
     /// `recv` data into `buf`
@@ -145,7 +140,7 @@ impl AsyncRead for KcpStream {
                 //buf = buf[n..].as_mut();
                 Poll::Ready(Ok(n))
             }
-            Err(KcpError::IoError(err)) =>Err(err).into(),
+            Err(KcpError::IoError(err)) => Err(err).into(),
             Err(err) => Err(io::Error::new(ErrorKind::Other, err)).into(),
         }
     }

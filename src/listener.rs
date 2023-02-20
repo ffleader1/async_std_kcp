@@ -57,6 +57,7 @@ impl KcpListener {
 
             let mut sessions = KcpSessionManager::new();
             let mut packet_buffer = [0u8; 2048];
+
             loop {
                 select! {
                     peer_addr = close_rx.next().fuse() => {
@@ -143,6 +144,7 @@ impl KcpListener {
         loop {
             match self.accept_rx.try_next() {
                 Err(_) =>{
+                    task::sleep(Duration::from_secs(1)).await;
                     continue
                 }
                 Ok(v) => {
@@ -169,7 +171,7 @@ impl KcpListener {
 #[cfg(unix)]
 impl std::os::unix::io::AsRawFd for KcpListener {
     fn as_raw_fd(&self) -> std::os::unix::prelude::RawFd {
-        self.udp.unwrap().as_raw_fd()
+        self.udp.as_raw_fd()
     }
 }
 

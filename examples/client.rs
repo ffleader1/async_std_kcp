@@ -4,7 +4,7 @@ use async_std::io::{stdin};
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_kcp::{KcpConfig, KcpStream};
 
-#[tokio::main]
+#[async_std::main]
 async fn main() {
     env_logger::init();
 

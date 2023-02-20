@@ -22,6 +22,7 @@ rand = "0.8"
 spin = "0.9"
 async-notify = "0.2.0"
 async-trait = "0.1.64"
+async-fuse = "0.11.3"
 
 [dev-dependencies]
 env_logger = "0.9"
@@ -32,5 +33,12 @@ async-notify = "0.2.0"
 async-trait = "0.1.64"
 
 [[example]]
-name = "server_test"
+edition = "2021"
+name = "server_bin"
 path = "examples/server.rs"
+
+
+[[example]]
+edition = "2021"
+name = "client_bin"
+path = "examples/client.rs"

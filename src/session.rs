@@ -26,7 +26,6 @@ use async_std::{
 use futures::channel::mpsc::{channel, Sender};
 use futures::stream::StreamExt;
 use futures::sink::SinkExt;
-
 use crate::{skcp::KcpSocket, KcpConfig};
 
 
@@ -84,11 +83,10 @@ impl KcpSession {
             session_close_notifier,
             input_tx,
         ));
-
         let io_task_handle = {
             let session = session.clone();
             task::spawn(async move {
-                let mut input_buffer = [0u8; 65536];
+                let mut input_buffer = [0u8; 5536];
 
                 loop {
                     futures::select! {
@@ -209,7 +207,6 @@ impl KcpSession {
                             }
                         }
                     };
-
                     select! {
                         _ = {task::sleep(next).await;futures::future::ready(4)} => {},
                         _ = session.notifier.notified().fuse() => {},

@@ -14,15 +14,10 @@ use tokio_kcp::{KcpConfig, KcpListener};
 #[async_std::main]
 async fn main() {
     env_logger::init();
-    println!("so 1");
     let config = KcpConfig::default();
-    println!("so 2");
     let server_addr = "127.0.0.1:3100".parse::<SocketAddr>().unwrap();
-    println!("so 3");
     let mut listener = KcpListener::bind(config, server_addr).await.unwrap();
-    println!("so 3.5");
     loop {
-        println!("so 3");
         let (mut stream, peer_addr) = match listener.accept().await {
             Ok(s) => s,
             Err(err) => {
@@ -31,8 +26,6 @@ async fn main() {
                 continue;
             }
         };
-        println!("so 4");
-        info!("accepted {}", peer_addr);
 
         task::spawn(async move {
             let mut buffer = [0u8; 8192];

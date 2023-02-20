@@ -216,7 +216,7 @@ impl KcpSocket {
             return Ok(0).into();
         }
 
-        let r = match self.kcp.recv(buf) {
+       match self.kcp.recv(buf) {
             e @ (Ok(0) | Err(KcpError::RecvQueueEmpty) | Err(KcpError::ExpectingFragment)) => {
                 trace!(
                     "[RECV] rcvwnd={} peeksize={} r={:?}",
@@ -224,25 +224,21 @@ impl KcpSocket {
                     self.kcp.peeksize().unwrap_or(0),
                     e
                 );
-                //println!("hi1");
+
                 if let Some(waker) = self.pending_receiver.replace(cx.waker().clone()) {
                     if !cx.waker().will_wake(&waker) {
                         waker.wake();
                     }
                 }
-                //println!("hi2");
+
                 Poll::Pending
             }
-            Err(err) => {println!("hi3");Err(err).into()},
+            Err(err) => Err(err).into(),
             Ok(n) => {
-                //println!("hi4");
                 self.last_update = Instant::now();
                 Ok(n).into()
             }
-        };
-        //println!("Poll iin result {:?}", r);
-        //println!("hi out 5");
-        r
+        }
     }
 
     #[allow(dead_code)]
@@ -400,7 +396,7 @@ mod test {
                 loop {
                     let mut kcp = kcp2.lock().await;
                     let next = kcp.update().expect("update");
-                    //println!("kcp2 next tick {:?} in", next);
+
                     trace!("kcp2 next tick {:?} in", next);
                     task::sleep(next).await;
                 }
